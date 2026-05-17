@@ -2,7 +2,7 @@ python-telegram-bot==20.7
 aiohttp==3.9.1
 aiofiles==23.2.1
 beautifulsoup4==4.12.2
-Pillow==10.4.0
+Pillow==11.1.0
 imageio==2.35.1
 imageio-ffmpeg==0.5.1
 numpy==2.1.0
