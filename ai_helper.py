@@ -1,31 +1,26 @@
 import os
 import aiohttp
 import json
+import re
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 async def generate_product_content(product: dict) -> dict:
     """توليد محتوى المنتج باستخدام Claude AI"""
     
-    prompt = f"""أنت خبير تسويق رقمي متخصص في بيع الملفات الإبداعية.
+    prompt = f"""You are a digital marketing expert specializing in selling creative design files.
 
-المنتج: {product['name']}
-النيش: {product.get('query', 'تصاميم إبداعية')}
+Product name: {product['name']}
+Niche: {product.get('query', 'creative designs')}
 
-اكتب لي بالإنجليزية:
-1. عنوان جذاب للمنتج (max 80 حرف)
-2. وصف تسويقي مقنع (150-200 كلمة)
-3. 5 كلمات مفتاحية مهمة
-4. سعر مناسب بالدولار (بين 3 و 9)
-5. وسوم TikTok (10 هاشتاق)
+Write marketing content in English. Respond ONLY with a valid JSON object, no extra text, no markdown:
 
-أجب بصيغة JSON فقط بدون أي نص إضافي:
 {{
-  "title": "...",
-  "description": "...",
-  "keywords": ["...", "...", "...", "...", "..."],
+  "title": "catchy product title max 80 chars",
+  "description": "compelling marketing description 150-200 words",
+  "keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"],
   "price": "4.99",
-  "tiktok_tags": "#tag1 #tag2 ..."
+  "tiktok_tags": "#svg #design #cricut #crafts #diy #silhouette #crafting #svgfile #cuttingfile #designbundle"
 }}"""
 
     headers = {
@@ -35,7 +30,7 @@ async def generate_product_content(product: dict) -> dict:
     }
     
     payload = {
-        "model": "claude-sonnet-4-20250514",
+        "model": "claude-haiku-4-5-20251001",
         "max_tokens": 1000,
         "messages": [{"role": "user", "content": prompt}]
     }
@@ -47,14 +42,29 @@ async def generate_product_content(product: dict) -> dict:
             json=payload
         ) as response:
             data = await response.json()
-            text = data["content"][0]["text"]
             
-            # تنظيف الرد وتحويله إلى JSON
+            if "error" in data:
+                raise Exception(f"Anthropic API error: {data['error'].get('message', 'Unknown error')}")
+            
+            text = data["content"][0]["text"].strip()
+            
+            # تنظيف الرد
+            text = re.sub(r'```json\s*', '', text)
+            text = re.sub(r'```\s*', '', text)
             text = text.strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
+            
+            # استخراج JSON
+            json_match = re.search(r'\{.*\}', text, re.DOTALL)
+            if json_match:
+                text = json_match.group()
             
             content = json.loads(text)
+            
+            # التأكد من وجود جميع الحقول
+            content.setdefault("title", product['name'])
+            content.setdefault("description", f"Beautiful {product['name']} for your creative projects!")
+            content.setdefault("keywords", ["svg", "design", "cricut", "crafts", "diy"])
+            content.setdefault("price", "4.99")
+            content.setdefault("tiktok_tags", "#svg #design #cricut #crafts #diy")
+            
             return content
