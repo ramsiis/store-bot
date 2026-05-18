@@ -5,7 +5,6 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
 )
-from cf_scraper import search_products, download_product
 from ai_helper import generate_product_content
 from gumroad_uploader import upload_to_gumroad
 from video_maker import create_promo_video
@@ -15,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DOWNLOAD_DIR = "/tmp/downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def is_admin(update: Update) -> bool:
     return update.effective_user.id == ADMIN_ID
@@ -24,12 +25,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ غير مصرح لك.")
         return
     keyboard = [
-        [InlineKeyboardButton("🔍 ابحث عن منتجات", callback_data="search")],
-        [InlineKeyboardButton("🤖 تشغيل تلقائي", callback_data="auto")],
+        [InlineKeyboardButton("📤 رفع ملف جديد", callback_data="upload")],
         [InlineKeyboardButton("📊 إحصائيات", callback_data="stats")],
     ]
     await update.message.reply_text(
-        "🛒 *مرحباً! اختر ما تريد فعله:*",
+        "🛒 *مرحباً بك في بوت المتجر!*\n\n"
+        "الطريقة:\n"
+        "1️⃣ نزّل الملف من Creative Fabrica\n"
+        "2️⃣ أرسله هنا\n"
+        "3️⃣ البوت يرفعه على Gumroad تلقائياً 🚀\n"
+        "4️⃣ ينشئ فيديو TikTok جاهز!",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -39,16 +44,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data == "search":
+    if data == "upload":
         await query.edit_message_text(
-            "🔍 أرسل لي الكلمة التي تريد البحث عنها في Creative Fabrica\n"
-            "مثال: floral svg, christmas fonts, watercolor"
+            "📤 *أرسل الملف الآن!*\n\n"
+            "يمكنك إرسال:\n"
+            "• ملف ZIP مباشرة\n"
+            "• أو أي ملف تصميم\n\n"
+            "⚠️ بعد الإرسال أخبرني اسم المنتج ونوعه",
+            parse_mode="Markdown"
         )
-        context.user_data["waiting_for"] = "search_query"
-
-    elif data == "auto":
-        await query.edit_message_text("🤖 جاري تشغيل الوضع التلقائي...")
-        await run_auto_mode(query, context)
+        context.user_data["waiting_for"] = "file"
 
     elif data == "stats":
         stats = context.bot_data.get("stats", {"uploaded": 0, "earned": 0.0})
@@ -59,36 +64,109 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    elif data.startswith("select_"):
-        # اختيار منتج من نتائج البحث
-        index = int(data.split("_")[1])
-        products = context.user_data.get("search_results", [])
-        
-        if not products or index >= len(products):
-            await query.edit_message_text("❌ انتهت الجلسة، ابحث مجدداً.")
-            return
-        
-        product = products[index]
-        await query.edit_message_text(
-            f"📦 تم اختيار: *{product['name']}*\n\n"
-            f"⏳ جاري المعالجة...",
-            parse_mode="Markdown"
-        )
-        await process_product(query, context, product)
+    elif data == "confirm_upload":
+        product = context.user_data.get("pending_product")
+        file_path = context.user_data.get("pending_file")
+        if product and file_path:
+            await query.edit_message_text("⏳ جاري المعالجة...")
+            await process_product(query, context, product, file_path)
+        else:
+            await query.edit_message_text("❌ لا يوجد ملف معلق، أرسل الملف مجدداً.")
 
     elif data == "back":
-        await start_from_query(query, context)
+        keyboard = [
+            [InlineKeyboardButton("📤 رفع ملف جديد", callback_data="upload")],
+            [InlineKeyboardButton("📊 إحصائيات", callback_data="stats")],
+        ]
+        await query.edit_message_text(
+            "🛒 *اختر ما تريد فعله:*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
 
-async def process_product(query, context, product):
-    """معالجة المنتج: تنزيل → محتوى → رفع → فيديو"""
+async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    # استقبال الملف
+    file = update.message.document or (update.message.photo[-1] if update.message.photo else None)
+    
+    if not file:
+        await update.message.reply_text("❌ لم أستطع استقبال الملف، جرب مرة أخرى.")
+        return
+
+    await update.message.reply_text("📥 جاري استقبال الملف...")
+    
+    # تحميل الملف
+    file_obj = await file.get_file()
+    if update.message.document:
+        filename = update.message.document.file_name or "product.zip"
+    else:
+        filename = "product_image.jpg"
+    
+    file_path = f"{DOWNLOAD_DIR}/{filename}"
+    await file_obj.download_to_drive(file_path)
+    
+    context.user_data["pending_file"] = file_path
+    context.user_data["waiting_for"] = "product_name"
+    
+    await update.message.reply_text(
+        "✅ تم استقبال الملف!\n\n"
+        "📝 أرسل لي *اسم المنتج* (بالإنجليزية)\n"
+        "مثال: Floral SVG Bundle, Christmas Fonts Pack",
+        parse_mode="Markdown"
+    )
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    waiting = context.user_data.get("waiting_for")
+    text = update.message.text
+
+    if waiting == "product_name":
+        context.user_data["waiting_for"] = "product_niche"
+        context.user_data["product_name"] = text
+        await update.message.reply_text(
+            f"✅ الاسم: *{text}*\n\n"
+            "🏷️ أرسل لي *نيش* المنتج (بالإنجليزية)\n"
+            "مثال: SVG, Fonts, Clipart, Embroidery, Planner",
+            parse_mode="Markdown"
+        )
+
+    elif waiting == "product_niche":
+        context.user_data["waiting_for"] = None
+        name = context.user_data.get("product_name", "Product")
+        niche = text
+        file_path = context.user_data.get("pending_file")
+
+        product = {
+            "name": name,
+            "query": niche,
+            "url": "",
+            "image": ""
+        }
+        context.user_data["pending_product"] = product
+
+        keyboard = [
+            [InlineKeyboardButton("✅ تأكيد الرفع", callback_data="confirm_upload")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="back")],
+        ]
+        await update.message.reply_text(
+            f"📋 *ملخص المنتج:*\n\n"
+            f"📦 الاسم: {name}\n"
+            f"🏷️ النيش: {niche}\n"
+            f"📁 الملف: جاهز ✅\n\n"
+            f"هل تريد المتابعة؟",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+async def process_product(query, context, product, file_path):
+    """توليد المحتوى + رفع على Gumroad + فيديو"""
     try:
-        # تنزيل الملف
-        await query.message.reply_text("📥 جاري تنزيل الملف من Creative Fabrica...")
-        file_path = await download_product(product)
-        await query.message.reply_text("✅ تم التنزيل!")
-
         # توليد المحتوى
-        await query.message.reply_text("🤖 جاري توليد العنوان والوصف بالذكاء الاصطناعي...")
+        await query.message.reply_text("🤖 جاري توليد العنوان والوصف...")
         content = await generate_product_content(product)
         await query.message.reply_text(
             f"✅ *تم توليد المحتوى:*\n\n"
@@ -102,18 +180,18 @@ async def process_product(query, context, product):
         result = await upload_to_gumroad(file_path, content)
         await query.message.reply_text(
             f"🎉 *تم الرفع بنجاح!*\n\n"
-            f"🔗 الرابط: {result.get('url', 'N/A')}\n"
+            f"🔗 {result.get('url', 'N/A')}\n"
             f"💰 السعر: ${content['price']}",
             parse_mode="Markdown"
         )
 
-        # إنشاء الفيديو
-        await query.message.reply_text("🎬 جاري إنشاء الفيديو الترويجي...")
+        # إنشاء فيديو TikTok
+        await query.message.reply_text("🎬 جاري إنشاء فيديو TikTok...")
         video_path = await create_promo_video(product, content)
         with open(video_path, "rb") as v:
             await query.message.reply_video(
                 video=v,
-                caption=f"🎬 فيديو ترويجي جاهز للنشر على TikTok!\n\n{content.get('tiktok_tags', '')}"
+                caption=f"🎬 فيديو جاهز للنشر على TikTok!\n\n{content.get('tiktok_tags', '')}"
             )
 
         # تحديث الإحصائيات
@@ -122,11 +200,9 @@ async def process_product(query, context, product):
         stats["earned"] += float(content.get("price", 0))
         context.bot_data["stats"] = stats
 
-        # زر للعودة
-        keyboard = [[InlineKeyboardButton("🔍 بحث جديد", callback_data="search"),
-                     InlineKeyboardButton("🏠 الرئيسية", callback_data="back")]]
+        keyboard = [[InlineKeyboardButton("📤 رفع منتج جديد", callback_data="upload")]]
         await query.message.reply_text(
-            "✅ *اكتملت العملية بنجاح!*",
+            "✅ *اكتملت العملية بنجاح!*\n\nهل تريد رفع منتج آخر؟",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
@@ -134,66 +210,12 @@ async def process_product(query, context, product):
     except Exception as e:
         await query.message.reply_text(f"❌ خطأ: {str(e)}")
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-
-    waiting = context.user_data.get("waiting_for")
-
-    if waiting == "search_query":
-        query_text = update.message.text
-        context.user_data["waiting_for"] = None
-        await update.message.reply_text(f"🔍 جاري البحث عن: *{query_text}*...", parse_mode="Markdown")
-
-        try:
-            products = await search_products(query_text)
-            if not products:
-                await update.message.reply_text("❌ لم يتم العثور على منتجات، جرب كلمة أخرى.")
-                return
-
-            keyboard = []
-            for i, p in enumerate(products[:8]):
-                keyboard.append([InlineKeyboardButton(
-                    f"📦 {p['name'][:35]}",
-                    callback_data=f"select_{i}"
-                )])
-            
-            context.user_data["search_results"] = products
-            await update.message.reply_text(
-                f"✅ وجدت *{len(products)}* منتج. اختر واحداً:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            await update.message.reply_text(f"❌ خطأ: {str(e)}")
-
-async def start_from_query(query, context):
-    keyboard = [
-        [InlineKeyboardButton("🔍 ابحث عن منتجات", callback_data="search")],
-        [InlineKeyboardButton("🤖 تشغيل تلقائي", callback_data="auto")],
-        [InlineKeyboardButton("📊 إحصائيات", callback_data="stats")],
-    ]
-    await query.edit_message_text(
-        "🛒 *مرحباً! اختر ما تريد فعله:*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def run_auto_mode(query, context):
-    niches = ["floral svg", "christmas svg", "watercolor clipart"]
-    for niche in niches[:1]:
-        await query.message.reply_text(f"🔍 البحث في نيش: *{niche}*", parse_mode="Markdown")
-        try:
-            products = await search_products(niche)
-            if products:
-                await process_product(query, context, products[0])
-        except Exception as e:
-            await query.message.reply_text(f"❌ خطأ: {str(e)}")
-
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, file_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     logger.info("🤖 البوت يعمل...")
     app.run_polling()
