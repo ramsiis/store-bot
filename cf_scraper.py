@@ -1,145 +1,142 @@
 import os
-import asyncio
+import aiohttp
 import aiofiles
-from playwright.async_api import async_playwright
+from bs4 import BeautifulSoup
 
 CF_EMAIL = os.getenv("CF_EMAIL", "")
 CF_PASSWORD = os.getenv("CF_PASSWORD", "")
 DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-async def get_browser():
-    """تشغيل متصفح حقيقي"""
-    playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-        ]
-    )
-    return playwright, browser
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
 
-async def login(page):
-    """تسجيل الدخول في Creative Fabrica"""
-    await page.goto("https://www.creativefabrica.com/login/", wait_until="networkidle")
-    await page.fill("input[name='username']", CF_EMAIL)
-    await page.fill("input[name='password']", CF_PASSWORD)
-    await page.click("button[type='submit'], input[type='submit']")
-    await page.wait_for_load_state("networkidle")
-    
-    # التحقق من نجاح تسجيل الدخول
-    if "login" in page.url or "incorrect" in await page.content():
-        raise Exception("❌ فشل تسجيل الدخول - تحقق من CF_EMAIL و CF_PASSWORD")
-    
-    return True
-
-async def search_products(query: str, limit: int = 8) -> list:
-    """البحث عن منتجات في Creative Fabrica"""
-    playwright, browser = await get_browser()
-    products = []
-    
+async def get_logged_in_session() -> aiohttp.ClientSession:
+    """إنشاء جلسة مع تسجيل الدخول التلقائي"""
+    session = aiohttp.ClientSession(headers=HEADERS)
     try:
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
-        page = await context.new_page()
-        
-        # تسجيل الدخول
-        await login(page)
-        
-        # البحث
-        search_url = f"https://www.creativefabrica.com/?s={query.replace(' ', '+')}&post_type=product"
-        await page.goto(search_url, wait_until="networkidle")
-        
-        # انتظار تحميل المنتجات
-        await page.wait_for_timeout(2000)
-        
-        # استخراج المنتجات
-        items = await page.query_selector_all(".product-card, .product-item, li.product, article.product")
-        
-        if not items:
-            # بحث بديل
-            items = await page.query_selector_all("a[href*='/product/']")
-            for item in items[:limit]:
-                href = await item.get_attribute("href")
-                name = await item.inner_text()
-                img = await item.query_selector("img")
-                img_src = await img.get_attribute("src") if img else ""
-                if href and name and len(name.strip()) > 3:
-                    products.append({
-                        "name": name.strip()[:80],
-                        "url": href,
-                        "image": img_src or "",
-                        "query": query
-                    })
-        else:
+        # الخطوة 1: الحصول على nonce
+        async with session.get("https://www.creativefabrica.com/login/") as resp:
+            html = await resp.text()
+            soup = BeautifulSoup(html, "html.parser")
+            nonce_input = soup.select_one("input[name='woocommerce-login-nonce']")
+            nonce = nonce_input.get("value", "") if nonce_input else ""
+
+        # الخطوة 2: تسجيل الدخول
+        login_data = {
+            "username": CF_EMAIL,
+            "password": CF_PASSWORD,
+            "woocommerce-login-nonce": nonce,
+            "_wp_http_referer": "/login/",
+            "login": "Log in",
+        }
+        async with session.post(
+            "https://www.creativefabrica.com/login/",
+            data=login_data,
+            allow_redirects=True
+        ) as resp:
+            html = await resp.text()
+            if "incorrect" in html.lower() or "wrong password" in html.lower():
+                raise Exception("❌ بيانات Creative Fabrica خاطئة! تحقق من CF_EMAIL و CF_PASSWORD")
+        return session
+    except Exception as e:
+        if "CF_EMAIL" in str(e) or "بيانات" in str(e):
+            await session.close()
+            raise e
+        return session
+
+async def search_products(query: str, limit: int = 10) -> list:
+    """البحث عن منتجات في Creative Fabrica"""
+    url = f"https://www.creativefabrica.com/?s={query.replace(' ', '+')}&post_type=product"
+    session = await get_logged_in_session()
+    try:
+        async with session.get(url) as response:
+            if response.status == 403:
+                raise Exception("❌ فشل تسجيل الدخول - تحقق من CF_EMAIL و CF_PASSWORD في Railway Variables")
+            if response.status != 200:
+                raise Exception(f"فشل الاتصال بـ Creative Fabrica: {response.status}")
+
+            html = await response.text()
+            soup = BeautifulSoup(html, "html.parser")
+            products = []
+
+            # محاولة عدة selectors
+            items = []
+            for sel in [".product-card", ".product-item", "article.product", "li.product"]:
+                items = soup.select(sel)
+                if items:
+                    break
+
+            # بحث بديل عبر الروابط
+            if not items:
+                for a in soup.select("a[href*='/product/']"):
+                    href = a.get("href", "")
+                    name = a.get_text(strip=True)
+                    img = a.select_one("img")
+                    if href and name and len(name) > 3:
+                        products.append({
+                            "name": name[:80],
+                            "url": href,
+                            "image": img.get("src", "") if img else "",
+                            "query": query
+                        })
+                        if len(products) >= limit:
+                            break
+                return products
+
             for item in items[:limit]:
                 try:
-                    name_el = await item.query_selector("h2, h3, .title, .product-title, .name")
-                    link_el = await item.query_selector("a[href]")
-                    img_el = await item.query_selector("img")
-                    
+                    name_el = item.select_one("h2, h3, .product-title, .title, .name")
+                    link_el = item.select_one("a[href]")
+                    img_el = item.select_one("img")
                     if name_el and link_el:
-                        name = await name_el.inner_text()
-                        href = await link_el.get_attribute("href")
-                        img_src = await img_el.get_attribute("src") if img_el else ""
-                        
                         products.append({
-                            "name": name.strip()[:80],
-                            "url": href,
-                            "image": img_src or "",
+                            "name": name_el.get_text(strip=True)[:80],
+                            "url": link_el.get("href", ""),
+                            "image": img_el.get("src", img_el.get("data-src", "")) if img_el else "",
                             "query": query
                         })
                 except Exception:
                     continue
-        
-        await context.close()
-        
+            return products
     finally:
-        await browser.close()
-        await playwright.stop()
-    
-    return products
+        await session.close()
 
 async def download_product(product: dict) -> str:
     """تنزيل ملف المنتج"""
-    playwright, browser = await get_browser()
-    
+    session = await get_logged_in_session()
     try:
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            accept_downloads=True
-        )
-        page = await context.new_page()
-        
-        # تسجيل الدخول
-        await login(page)
-        
-        # فتح صفحة المنتج
-        await page.goto(product["url"], wait_until="networkidle")
-        await page.wait_for_timeout(2000)
-        
-        # البحث عن زر التنزيل
-        download_btn = await page.query_selector(
-            ".download-btn, .btn-download, a[href*='download'], button:has-text('Download'), a:has-text('Download')"
-        )
-        
-        if download_btn:
-            # تنزيل الملف
-            async with page.expect_download() as download_info:
-                await download_btn.click()
-            
-            download = await download_info.value
-            safe_name = "".join(c for c in product['name'][:40] if c.isalnum() or c in ' _-').strip()
-            filename = f"{DOWNLOAD_DIR}/{safe_name}.zip"
-            await download.save_as(filename)
-            return filename
-        else:
-            raise Exception("❌ لم يتم العثور على زر التنزيل")
-            
+        async with session.get(product["url"]) as response:
+            html = await response.text()
+            soup = BeautifulSoup(html, "html.parser")
+
+            download_link = None
+            for a in soup.select("a[href]"):
+                href = a.get("href", "")
+                if "download" in href.lower() or ".zip" in href.lower():
+                    download_link = href
+                    break
+
+            if not download_link:
+                btn = soup.select_one(".download-btn, .btn-download, [data-download]")
+                if btn:
+                    download_link = btn.get("href") or btn.get("data-download")
+
+            if not download_link:
+                slug = product["url"].rstrip("/").split("/")[-1]
+                download_link = f"https://www.creativefabrica.com/product/{slug}/download/"
+
+            async with session.get(download_link, allow_redirects=True) as dl_response:
+                if dl_response.status == 200:
+                    safe_name = "".join(c for c in product['name'][:40] if c.isalnum() or c in ' _-').strip()
+                    filename = f"{DOWNLOAD_DIR}/{safe_name}.zip"
+                    async with aiofiles.open(filename, "wb") as f:
+                        await f.write(await dl_response.read())
+                    return filename
+                else:
+                    raise Exception(f"فشل التنزيل: {dl_response.status}")
     finally:
-        await browser.close()
-        await playwright.stop()
+        await session.close()
